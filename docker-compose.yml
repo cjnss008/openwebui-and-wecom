@@ -1,0 +1,28 @@
+services:
+  wecom-bridge:
+    image: python:3.11-slim
+    container_name: wecom-bridge
+    working_dir: /app
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        pip install -U pip
+        pip install --root-user-action=ignore fastapi 'uvicorn[standard]' requests wechatpy pycryptodome
+        python -c "from Crypto.Cipher import AES; import wechatpy; print('wechatpy & Crypto backend OK')"
+        env | grep -E '^(WECOM_|OWUI_)' || true
+        uvicorn app:app --host 0.0.0.0 --port 9000   # ← 容器内仍用 9000
+    ports:
+      - "127.0.0.1:11111:9000"                       # ← 仅宿主机端口换 11111
+    env_file:
+      - .env.wecom
+    volumes:
+      - /var/lib/docker/volumes/wecom-bridge:/app:ro
+    networks:
+      - docker_openwebui-network
+    restart: unless-stopped
+
+networks:
+  docker_openwebui-network:
+    external: true
