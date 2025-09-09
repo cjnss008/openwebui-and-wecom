@@ -12,6 +12,16 @@ try:
     _PIL_OK = True
 except Exception:
     _PIL_OK = False
+
+def _pick_chat_id(user_token: str, fallback_chat_id: str):
+    """
+    兼容旧调用：尝试回读 chat，返回 (chat_id, chat_json)。失败则返回 fallback。
+    """
+    try:
+        js = owui_fetch_chat(user_token, fallback_chat_id)
+        return fallback_chat_id, js
+    except Exception:
+        return fallback_chat_id, {}
 # ----------------------------- LOGGING -----------------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s: %(message)s")
 log = logging.getLogger("wecom-bridge")
@@ -29,7 +39,7 @@ def _is_placeholder_text(s: str) -> bool:
     for key in ("后台生成中", "后台处理中", "处理中，请稍候", "模型生成中或无输出"):
         if key in t_norm:
             return True
-    if t_norm in {"（后台生成中…）", "（模型生成中或无输出）", "（处理中，请稍候…）"}:
+    if t_norm in {"", "（模型生成中或无输出）", "（处理中，请稍候…）"}:
         return True
     return False
 
@@ -60,7 +70,7 @@ RATE_LIMIT_COOLDOWN_SEC = int(_env("WECOM_KF_RL_COOLDOWN_SEC") or "60")
 MAX_CONTEXT_MSGS = int(_env("OWUI_MAX_CONTEXT_MSGS") or "30")
 POLL_TIMEOUT_SEC = float(_env("WECOM_POLL_TIMEOUT_SEC") or "30")
 POLL_INTERVAL_SEC = float(_env("WECOM_POLL_INTERVAL_SEC") or "0.6")
-OWUI_FORCE_ASSISTANT_PLACEHOLDER_WHEN_EMPTY = int(_env("OWUI_FORCE_ASSISTANT_PLACEHOLDER_WHEN_EMPTY") or "1")
+OWUI_FORCE_ASSISTANT_PLACEHOLDER_WHEN_EMPTY = int(_env("OWUI_FORCE_ASSISTANT_PLACEHOLDER_WHEN_EMPTY") or "0")
 # —— 关键修复：启动期丢弃旧消息 + 持久去重配置 ——
 KF_DROP_OLD_MSGS_SEC = int(_env("KF_DROP_OLD_MSGS_SEC") or "120")  # 建议设置 5~15
 SEEN_PERSIST_MAX = int(_env("SEEN_PERSIST_MAX") or "2000")
@@ -176,9 +186,16 @@ def _shorten(obj: Any, n: int = 300) -> str:
         s = str(obj)
     return (s[:n] + ("..." if len(s) > n else ""))
 def _owui_req(method: str, path: str, token: str, **kwargs) -> requests.Response:
+    # HARD BLOCK tasks endpoints to avoid fetching HTML app shell
+    _pl = str(path).lower()
+    if ('tasks' in _pl) or ('disabled-tasks' in _pl) or ('tasks_disabled' in _pl):
+        log.error('HARD BLOCK: attempted to call tasks endpoint: %s', path)
+        raise RuntimeError('Tasks endpoints disabled; use chat-poll + /api/chat/completed.')
     url = f"{OWUI}{path}"
     headers = kwargs.pop("headers", {})
     headers["Authorization"] = f"Bearer {token}"
+    if method.upper() == 'GET' and 'Accept' not in headers:
+        headers['Accept'] = 'application/json'
     tid = f"T{uuid.uuid4().hex[:8]}"
     body_preview = ""
     if DEBUG_HTTP:
@@ -280,6 +297,18 @@ def _ensure_str_content(msg_obj: Dict[str, Any]) -> str:
         return msg_obj["response"]
     return ""
 
+
+
+def _mk_content_parts(text: str, images: list[str]) -> list[dict]:
+    parts = []
+    t = (text or "").strip()
+    if t:
+        parts.append({"type": "text", "text": t})
+    for u in images or []:
+        if not u:
+            continue
+        parts.append({"type": "image_url", "image_url": {"url": u}})
+    return parts
 def _extract_all_images_from_msg(m: dict, fallback_text: str = "") -> list[str]:
     urls = []
     content = m.get("content")
@@ -321,6 +350,30 @@ def _extract_images_from_msgobj(msg_obj: Dict[str, Any], text: str) -> List[str]
                 iu = p.get("image_url")
                 if isinstance(iu, dict) and iu.get("url"):
                     images.append(iu["url"])
+    # Also look into common attachment-like containers
+    for k in ("attachments", "files", "artifacts", "image_urls"):
+        v = msg_obj.get(k)
+        if isinstance(v, list):
+            for it in v:
+                if isinstance(it, str):
+                    images.append(it)
+                elif isinstance(it, dict):
+                    u = it.get("url") or it.get("src") or it.get("image_url") or ((it.get("image_url") or {}).get("url"))
+                    if isinstance(u, dict):
+                        u = u.get("url")
+                    if isinstance(u, str) and u:
+                        images.append(u)
+    # Handle OpenAI-like image data (data[].b64_json) possibly with mime_type
+    try:
+        data_list = msg_obj.get("data")
+        if isinstance(data_list, list):
+            for it in data_list:
+                b64 = (it or {}).get("b64_json")
+                if b64:
+                    mime = (it or {}).get("mime_type") or "image/png"
+                    images.append(f"data:{mime};base64,{b64}")
+    except Exception:
+        pass
     images += _extract_images_from_text(text)
     seen = set();
     im_out = []
@@ -593,12 +646,12 @@ def _poll_task_result(user_token: str, task_id: str,
     t0 = time.time()
     last_err: Optional[Exception] = None
     paths = [
-        f"/api/tasks/{task_id}",
-        f"/api/v1/tasks/{task_id}",
-        f"/api/tasks/{task_id}/result",
-        f"/api/v1/tasks/{task_id}/result",
-        f"/api/tasks/result/{task_id}",
-        f"/api/tasks/result?id={task_id}",
+        f"/api/TASKS_DISABLED/{task_id}",
+        f"/api/v1/TASKS_DISABLED/{task_id}",
+        f"/api/TASKS_DISABLED/{task_id}/result",
+        f"/api/v1/TASKS_DISABLED/{task_id}/result",
+        f"/api/TASKS_DISABLED/result/{task_id}",
+        f"/api/TASKS_DISABLED/result?id={task_id}",
     ]
     while (time.time() - t0) < timeout_sec:
         for p in paths:
@@ -651,7 +704,7 @@ def _poll_assistant_content(user_token: str, chat_id: str, assistant_mid: str,
                 if (m.get("role") == "assistant") and (str(m.get("id")) == str(assistant_mid)):
                     text = _ensure_str_content(m).strip()
                     imgs = _extract_images_from_msgobj(m, text)
-                    if text or imgs:
+                    if (text and not _is_placeholder_text(text)) or imgs:
                         return text, imgs
             if user_mid:
                 ts_user = None
@@ -666,7 +719,7 @@ def _poll_assistant_content(user_token: str, chat_id: str, assistant_mid: str,
                     if m.get("role") == "assistant" and str(m.get("parentId")) == str(user_mid):
                         text = _ensure_str_content(m).strip()
                         imgs = _extract_images_from_msgobj(m, text)
-                        if text or imgs:
+                        if (text and not _is_placeholder_text(text)) or imgs:
                             return text, imgs
                 if ts_user:
                     for m in msgs:
@@ -678,7 +731,7 @@ def _poll_assistant_content(user_token: str, chat_id: str, assistant_mid: str,
                             if ts_m >= ts_user:
                                 text = _ensure_str_content(m).strip()
                                 imgs = _extract_images_from_msgobj(m, text)
-                                if text or imgs:
+                                if (text and not _is_placeholder_text(text)) or imgs:
                                     return text, imgs
         except Exception as e:
             last_err = e
@@ -687,44 +740,86 @@ def _poll_assistant_content(user_token: str, chat_id: str, assistant_mid: str,
     if last_err:
         log.debug("poll timeout (last_err=%s)", last_err)
     return "", []
-def owui_chat_complete(user_token: str, messages: List[Dict[str, Any]],
-                       model: Optional[str] = None, chat_id: Optional[str] = None,
-                       assistant_id: Optional[str] = None, session_id: Optional[str] = None,
-                       poll: bool = True, user_id: Optional[str] = None) -> Tuple[
-    str, List[str], Optional[str], Dict[str, Any]]:
+def owui_chat_complete(
+    user_token: str,
+    messages,
+    chat_id: str | None = None,
+    model: str | None = None,
+    assistant_id: str | None = None,
+    session_id: str | None = None,
+    user_id: str | None = None,
+    poll: bool = True,
+):
+    """Kick completion and synchronously poll *chat* (no tasks).
+    Returns: (text, images, chat_id_created, raw_response_dict)
+    """
+    # 1) fire completion request (no streaming)
     data = owui_chat_complete_raw(
-        user_token=user_token, messages=messages, model=model,
-        chat_id=chat_id, assistant_id=assistant_id, session_id=session_id,
-        background_tasks={"title_generation": True}
+        user_token=user_token,
+        messages=messages,
+        chat_id=chat_id,
+        model=model,
+        assistant_id=assistant_id,
+        session_id=session_id,
+        # keep title generation enabled so OWUI auto-titles as before
+        background_tasks={"title_generation": True},
     )
-    direct_txt, direct_imgs = "", []
+
+    # 2) short-circuit if direct content is returned immediately
+    direct_txt = (data.get("choices") or [{}])[0].get("message", {}).get("content", "") if isinstance(data, dict) else ""
+    direct_imgs = (data.get("choices") or [{}])[0].get("message", {}).get("images", []) if isinstance(data, dict) else []
+    if (direct_txt and direct_txt.strip()) or direct_imgs:
+        return direct_txt or "", direct_imgs or [], chat_id, data
+
+    # 3) find the newest/current chat id
+    new_chat_id, _ = _pick_chat_id(user_token, chat_id)
+
+    # 4) optionally poll the chat for the assistant's message (by assistant_id)
+    if not poll:
+        return "", [], new_chat_id, data
+
+    # --- safe inits to avoid UnboundLocalError ---
+    got_text, got_imgs = "", []
+
+    # --- polling timeouts ---
     try:
-        msg_obj = (data.get("choices", [{}])[0].get("message", {}) or {})
-        direct_txt = _ensure_str_content(msg_obj).strip()
-        direct_imgs = _extract_images_from_msgobj(msg_obj, direct_txt)
+        SHORT = float(os.getenv("WECOM_SHORT_WINDOW_SEC", "5"))
     except Exception:
-        pass
-    task_id = (data.get("task_id") or _deep_find_first(data, "task_id") or "").strip() if isinstance(data, dict) else ""
-    # -------- 修复点：若同步已经拿到内容，则直接返回，不再轮询 --------
-    if direct_txt or direct_imgs:
-        log.info("complete: got direct content, skip polling (len=%s, imgs=%s)", len(direct_txt), len(direct_imgs))
-        new_chat_id = _pick_chat_id_from_resp(data)
-        return (direct_txt, direct_imgs, new_chat_id, data)
-    if chat_id and poll:
-        text, imgs = _poll_assistant_content(user_token, chat_id, assistant_id or "", user_mid=user_id)
-        if not (text.strip() or imgs) and task_id:
-            t_text, t_imgs = _poll_task_result(user_token, task_id)
-            if t_text.strip() or t_imgs:
-                text, imgs = t_text, t_imgs
-        log.info("complete(polled): text_len=%s preview=%r imgs=%s",
-                 len(text), (text or "")[:120], len(imgs))
-    else:
-        text, imgs = direct_txt, direct_imgs
-        log.info("complete: text_len=%s preview=%r imgs=%s",
-                 len(text), (text or "")[:120], len(imgs))
-    new_chat_id = _pick_chat_id_from_resp(data)
-    return (text, imgs, new_chat_id, data)
-# ---------------------------- Chats API ------------------------
+        SHORT = 5.0
+    # Short interval for the short window, capped to >=0.2s
+    INTERVAL = max(0.2, min(globals().get("POLL_INTERVAL_SEC", 0.5), 0.5))
+    DEFAULT_TIMEOUT = float(globals().get("POLL_TIMEOUT_SEC", 12.0))
+
+    # 4a) short-window poll (fast UI feedback)
+    if new_chat_id:
+        try:
+            c_text, c_imgs = _poll_assistant_content(
+                user_token, new_chat_id, assistant_id or "", user_mid=user_id,
+                timeout_sec=max(0.3, SHORT),
+                interval_sec=INTERVAL,
+            )
+            if (c_text and c_text.strip()) or c_imgs:
+                got_text, got_imgs = c_text or "", c_imgs or []
+        except Exception as e:
+            log.warning("short poll failed: %s", e)
+
+    # 4b) if still nothing, continue polling up to the normal timeout
+    if not ((got_text and got_text.strip()) or got_imgs) and new_chat_id:
+        left = max(0.0, DEFAULT_TIMEOUT - SHORT)
+        if left >= 0.2:
+            try:
+                c_text, c_imgs = _poll_assistant_content(
+                    user_token, new_chat_id, assistant_id or "", user_mid=user_id,
+                    timeout_sec=left,
+                    interval_sec=max(0.3, globals().get("POLL_INTERVAL_SEC", 0.7)),
+                )
+                if (c_text and c_text.strip()) or c_imgs:
+                    got_text, got_imgs = c_text or "", c_imgs or []
+            except Exception as e:
+                log.warning("long poll failed: %s", e)
+
+    log.info("complete(polled): text_len=%s preview=%r imgs=%s", len(got_text or ""), (got_text or "")[:60].replace("\n"," "), len(got_imgs or []))
+    return got_text or "", got_imgs or [], new_chat_id, data
 def _deep_find_msg_ids(js: Any) -> Tuple[Optional[str], Optional[str]]:
     user_mid = None
     assistant_mid = None
@@ -760,7 +855,7 @@ def owui_seed_chat_messages(user_token: str, chat_id: str, model: str, user_cont
     assistant_msg = {
         "id": assistant_mid,
         "role": "assistant",
-        "content": "（处理中，请稍候…）",
+        "content": "",
         "parentId": user_mid,
         "modelName": model,
         "modelIdx": 0,
@@ -779,7 +874,7 @@ def owui_seed_chat_messages(user_token: str, chat_id: str, model: str, user_cont
             },
         }
     }
-    r = _owui_req("POST", f"/api/v1/chats/{chat_id}", user_token,
+    r = _owui_req("POST", f"/api/v1/chats/{chat_id}?refresh=1", user_token,
                   headers={"Content-Type": "application/json"}, json=payload)
     if not r.ok:
         raise _improve_http_error(r, "注入占位消息失败(/api/v1/chats/{id})")
@@ -842,7 +937,7 @@ def owui_append_user_message(user_token: str, chat_id: str, model: str, user_con
             "history": { "current_id": user_mid, "messages": hist_msgs }
         }
     }
-    r = _owui_req("POST", f"/api/v1/chats/{chat_id}", user_token,
+    r = _owui_req("POST", f"/api/v1/chats/{chat_id}?refresh=1", user_token,
                   headers={"Content-Type": "application/json"}, json=payload)
     if not r.ok:
         raise _improve_http_error(r, "只追加用户消息失败(/api/v1/chats/{id})")
@@ -871,8 +966,7 @@ def owui_append_assistant_message(user_token: str, chat_id: str, model: str,
     assistant_msg = {
         "id": assistant_mid,
         "role": "assistant",
-        "content": assistant_text or "",
-        "images": images or [],
+        "content": _mk_content_parts(assistant_text or "", images or []),
         "parentId": parent_id,
         "modelName": model,
         "modelIdx": 0,
@@ -890,7 +984,7 @@ def owui_append_assistant_message(user_token: str, chat_id: str, model: str,
             },
         }
     }
-    r = _owui_req("POST", f"/api/v1/chats/{chat_id}", user_token,
+    r = _owui_req("POST", f"/api/v1/chats/{chat_id}?refresh=1", user_token,
                   headers={"Content-Type": "application/json"}, json=payload)
     if not r.ok:
         raise _improve_http_error(r, "只追加助手消息失败(/api/v1/chats/{id})")
@@ -923,7 +1017,7 @@ def owui_append_user_and_assistant(user_token: str, chat_id: str, model: str, us
     assistant_msg = {
         "id": assistant_mid,
         "role": "assistant",
-        "content": "（处理中，请稍候…）",  # 同上，避免 UI “加载中”
+        "content": "",  # 同上，避免 UI “加载中”
         "parentId": user_mid,
         "modelName": model,
         "modelIdx": 0,
@@ -942,7 +1036,7 @@ def owui_append_user_and_assistant(user_token: str, chat_id: str, model: str, us
             },
         }
     }
-    r = _owui_req("POST", f"/api/v1/chats/{chat_id}", user_token,
+    r = _owui_req("POST", f"/api/v1/chats/{chat_id}?refresh=1", user_token,
                   headers={"Content-Type": "application/json"}, json=payload)
     if not r.ok:
         raise _improve_http_error(r, "追加消息失败(/api/v1/chats/{id})")
@@ -983,68 +1077,94 @@ def owui_completed_save(user_token: str, chat_id: str,
                         images: List[str],
                         *, model: Optional[str] = None,
                         session_id: Optional[str] = None) -> bool:
-    """
-    ⚠️ 不再调用 /api/chat/completed 做历史持久化，
-    只在本地 **就地覆盖/追加** assistant（同一个 id），并维持 parentId 链与 current_id。
-    """
-    if (not (assistant_text or "").strip()) and (not images):
-        log.info("skip completed_save: no assistant content to persist yet")
+
+    # Ensure we only persist real content (skip placeholders)
+    _txt = (assistant_text or "").strip()
+    _imgs = images or []
+    if ("_is_placeholder_text" in globals()) and _is_placeholder_text(_txt) and not _imgs:
+        log.info("skip completed_save: placeholder/empty")
         return False
     if not assistant_mid:
         assistant_mid = str(uuid.uuid4())
     ts = int(time.time() * 1000)
 
-    # 回读现有 chat
-    chat_resp = owui_fetch_chat(user_token, chat_id)
-    chat = (chat_resp.get("chat") or chat_resp or {})
-    messages = list(chat.get("messages") or [])
-    history = chat.get("history") or {"current_id": None, "messages": {}}
-    hist_msgs = dict(history.get("messages") or {})
+    # 1) Overwrite or append assistant message with same id
+    try:
+        chat_resp = owui_fetch_chat(user_token, chat_id)
+        chat = (chat_resp.get("chat") or chat_resp or {})
+        messages = list(chat.get("messages") or [])
+        history = chat.get("history") or {"current_id": None, "messages": {}}
+        hist_msgs = dict(history.get("messages") or {})
+    except Exception as e:
+        log.warning("completed_save: fetch chat failed: %s", e)
+        chat = {"messages": [], "history": {"current_id": None, "messages": {}}}
+        messages, hist_msgs = [], {}
 
-    # 尝试找到本轮 user 以串联 parentId；找不到就保持原有 parentId
     parent_id = user_mid
     if not parent_id:
-        # fallback：找最后一条 user
         for m in reversed(messages):
             if isinstance(m, dict) and m.get("role") == "user" and m.get("id"):
                 parent_id = m.get("id"); break
 
-    # 构造/覆盖 assistant
-    asst_msg = hist_msgs.get(assistant_mid) or {"id": assistant_mid, "role": "assistant"}
-    asst_msg["content"] = assistant_text
-    if images:
-        asst_msg["images"] = images
-    asst_msg["timestamp"] = ts
-    if parent_id and not asst_msg.get("parentId"):
-        asst_msg["parentId"] = parent_id
-    # 就地覆盖 messages[] 中同 id 的那条，否则 append
+    assistant_obj = {
+        "id": assistant_mid,
+        "role": "assistant",
+        "content": _txt,
+        "timestamp": ts,
+        "parentId": parent_id,
+    }
+    if model:
+        assistant_obj["modelName"] = model
+        assistant_obj["modelIdx"] = 0
+    if _imgs:
+        assistant_obj["images"] = _imgs
+
     replaced = False
     for i, m in enumerate(messages):
-        if isinstance(m, dict) and m.get("id") == assistant_mid:
-            messages[i] = asst_msg
+        if str(m.get("id")) == str(assistant_mid):
+            messages[i] = assistant_obj
             replaced = True
             break
     if not replaced:
-        messages.append(asst_msg)
-    hist_msgs[assistant_mid] = asst_msg
+        messages.append(assistant_obj)
 
-    payload = {
-        "chat": {
-            "id": chat_id,
-            "messages": messages,
-            "history": { "current_id": assistant_mid, "messages": hist_msgs }
-        }
+    hist_msgs[str(assistant_mid)] = dict(assistant_obj)
+    history["messages"] = hist_msgs
+    history["current_id"] = str(assistant_mid)
+
+    payload_chat = {
+        "id": chat_id,
+        "messages": messages,
+        "history": history,
     }
-    r = _owui_req("POST", f"/api/v1/chats/{chat_id}", user_token,
-                  headers={"Content-Type": "application/json"}, json=payload)
-    if not r.ok:
-        raise _improve_http_error(r, "completed_save 覆盖/追加助手消息失败")
-    log.info("[completed-save] chat_id=%s asst=%s user=%s text_len=%s imgs=%s",
-             chat_id, assistant_mid, user_mid, len(assistant_text or ""), len(images or []))
+    r1 = _owui_req("POST", f"/api/v1/chats/{chat_id}?refresh=1", user_token,
+                   headers={"Content-Type": "application/json"},
+                   json={"chat": payload_chat})
+    if not r1.ok:
+        log.error("persist assistant overwrite failed: %s %s", r1.status_code, (r1.text or "")[:200])
+
+    # 2) Mark completed (required by OpenWebUI to exit 'generating')
+    payload_completed = {
+        "chat_id": chat_id,
+        "id": assistant_mid,
+    }
+    if session_id:
+        payload_completed["session_id"] = session_id
+    if model:
+        payload_completed["model"] = model
+
+    r2 = _owui_req("POST", "/api/chat/completed", user_token,
+                   headers={"Content-Type": "application/json"},
+                   json=payload_completed)
+    if not r2.ok:
+        log.error("OWUI completed failed: %s %s", r2.status_code, (r2.text or "")[:200])
+        return False
+
+    log.info("completed() OK for chat_id=%s assistant_id=%s", chat_id, assistant_mid)
     return True
 
 def owui_fetch_chat(user_token: str, chat_id: str) -> Dict[str, Any]:
-    r = _owui_req("GET", f"/api/v1/chats/{chat_id}", user_token, headers={"Accept": "application/json"})
+    r = _owui_req("GET", f"/api/v1/chats/{chat_id}?refresh=1", user_token, headers={"Accept": "application/json"})
     if not r.ok:
         raise _improve_http_error(r, "获取会话详情失败")
     return r.json() or {}
@@ -1311,7 +1431,7 @@ def _maybe_downscale_to_limit(data: bytes, filename: str) -> bytes:
         log.warning("downscale failed: %s", e)
     return data
 def _kf_upload_image_bytes(data: bytes, filename: str = "image.png") -> Optional[str]:
-    data = _maybe_downscale_to_limit(data, filename)
+    data, filename = _ensure_wechat_compatible_image(data, filename)
     mime = mimetypes.guess_type(filename)[0] or "application/octet-stream"
     files = {"media": (filename, data, mime)}
     access = get_kf_access_token()
@@ -1341,7 +1461,7 @@ def _kf_upload_image_bytes(data: bytes, filename: str = "image.png") -> Optional
         log.warning("media/upload fallback failed: %s", e)
     return None
 def send_kf_image_by_bytes(external_userid: str, data: bytes, filename: str = "image.jpg") -> bool:
-    data = _maybe_downscale_to_limit(data, filename)
+    data, filename = _ensure_wechat_compatible_image(data, filename)
     if _under_rl(external_userid):
         item = {
             "id": f"i_{uuid.uuid4().hex}",
@@ -1590,9 +1710,9 @@ def _get_latest_chat_image_url(user_token: str, chat_id: str) -> Optional[str]:
         log.debug("latest image lookup failed: %s", e)
     return None
 def _compose_user_content_consuming(u: Dict[str, Any], text: str) -> Any:
-    token = (u.get("token") or "").strip()
+    user_tok = (u.get("token") or "").strip()
     chat_id = (u.get("current_chat_id") or "").strip()
-    img = _get_latest_chat_image_url(token, chat_id) if (token and chat_id) else None
+    img = _get_latest_chat_image_url(user_tok, chat_id) if (user_tok and chat_id) else None
     if not img:
         img = _get_last_image_if_fresh(u)
         if img:
@@ -1605,6 +1725,7 @@ def _compose_user_content_consuming(u: Dict[str, Any], text: str) -> Any:
             {"type": "text", "text": text},
         ]
     return text
+
 def handle_command(ext_uid: str, text: str) -> str:
     text = (text or "").strip()
     if not text:
@@ -1623,6 +1744,7 @@ def handle_command(ext_uid: str, text: str) -> str:
     m = re.match(r"^绑定\s*(\S+)$", text)
     if m:
         u["token"] = m.group(1).strip()
+        u["current_chat_id"] = ""
         u["state"] = "MENU"
         _save_store(store)
         log.info("[bind] ext_uid=%s token=%s", ext_uid, _mask(u['token']))
@@ -1722,10 +1844,12 @@ def handle_command(ext_uid: str, text: str) -> str:
                 assistant_mid_seed = None
                 try:
                     if OWUI_FORCE_ASSISTANT_PLACEHOLDER_WHEN_EMPTY:
-                        _placeholder_text = "（后台生成中…）"
-                        assistant_mid_seed = owui_append_assistant_message(token, new_cid, mdl, _placeholder_text, [], parent_id=user_mid)
-                        log.info("placeholder seeded (new chat); no completed yet")
-                        _log_chat_summary(token, new_cid, "after placeholder (new chat)")
+                        _placeholder_text = "" if not OWUI_FORCE_ASSISTANT_PLACEHOLDER_WHEN_EMPTY else ""
+                    else:
+                        _placeholder_text = ""
+                    assistant_mid_seed = owui_append_assistant_message(token, new_cid, mdl, _placeholder_text, [], parent_id=user_mid)
+                    log.info("placeholder seeded (new chat); no completed yet")
+                    _log_chat_summary(token, new_cid, "after placeholder (new chat)")
                 except Exception as _e:
                     log.warning("placeholder append/completed (new) failed: %s", _e)
                 txt, imgs, created, raw = owui_chat_complete(
@@ -1739,10 +1863,11 @@ def handle_command(ext_uid: str, text: str) -> str:
                     u["current_chat_id"] = cid
                     _save_store(store)
                 if (txt.strip() or imgs):
-                    ok = owui_completed_save(
-                            token, cid, user_mid, assistant_mid_seed or None, user_content, txt, imgs,
+                    ok = owui_completed_save(token, cid, user_mid, assistant_mid_seed or None, user_content, ("" if _is_placeholder_text(txt) or not txt else txt), imgs,
                         model=mdl, session_id=session_id
                     )
+                    if ok and assistant_mid_seed:
+                        _try_completed(token, {"chat_id": cid, "id": assistant_mid_seed, "session_id": session_id, "model": mdl})
                     if not ok:
                         log.error("failed to persist completion to history (cid=%s)", cid)
                 if not txt.strip() and imgs:
@@ -1902,7 +2027,7 @@ def handle_command(ext_uid: str, text: str) -> str:
                             raise
                         user_mid = owui_append_user_message(token, new_cid, mdl, user_content)
                         u["current_chat_id"] = new_cid;
-                        _save_store(_load_store())
+                        _save_store(store)
                         chat_id = new_cid
                     else:
                         raise
@@ -1915,10 +2040,12 @@ def handle_command(ext_uid: str, text: str) -> str:
                 # --- Scheme A: assistant placeholder, immediately completed ---
                 try:
                     if OWUI_FORCE_ASSISTANT_PLACEHOLDER_WHEN_EMPTY:
-                        _placeholder_text = "（后台生成中…）"
-                        assistant_mid_seed = owui_append_assistant_message(token, chat_id, mdl, _placeholder_text, [], parent_id=user_mid)
-                        log.info("placeholder seeded; no completed yet")
-                        _log_chat_summary(token, chat_id, "after placeholder")
+                        _placeholder_text = "" if not OWUI_FORCE_ASSISTANT_PLACEHOLDER_WHEN_EMPTY else ""
+                    else:
+                        _placeholder_text = ""
+                    assistant_mid_seed = owui_append_assistant_message(token, chat_id, mdl, _placeholder_text, [], parent_id=user_mid)
+                    log.info("placeholder seeded; no completed yet")
+                    _log_chat_summary(token, chat_id, "after placeholder")
                 except Exception as _e:
                     log.warning("placeholder append/completed failed: %s", _e)
                 try:
@@ -1933,7 +2060,7 @@ def handle_command(ext_uid: str, text: str) -> str:
                         picked = _pick_first_available_model(token)
                         if picked:
                             u["model"] = picked;
-                            _save_store(_load_store())
+                            _save_store(store)
                             _apply_chat_model(token, chat_id, picked)
                             txt, imgs, _, _ = owui_chat_complete(
                                 user_token=token, messages=messages_for_llm, chat_id=chat_id,
@@ -1946,8 +2073,7 @@ def handle_command(ext_uid: str, text: str) -> str:
                     else:
                         raise
                 if (txt.strip() or imgs):
-                    owui_completed_save(
-                        token, chat_id, user_mid, assistant_mid_seed or None, user_content, txt, imgs,
+                    owui_completed_save(token, chat_id, user_mid, assistant_mid_seed or None, user_content, ("" if _is_placeholder_text(txt) or not txt else txt), imgs,
                         model=mdl, session_id=session_id
                     )
                 if not txt.strip() and imgs:
@@ -1987,7 +2113,7 @@ def handle_command(ext_uid: str, text: str) -> str:
                         picked = _pick_first_available_model(token)
                         if picked:
                             u["model"] = picked;
-                            _save_store(_load_store())
+                            _save_store(store)
                             _apply_chat_model(token, new_cid, picked)
                             txt, imgs, created, _ = owui_chat_complete(
                                 user_token=token, messages=messages_for_llm, model=picked,
@@ -2004,8 +2130,7 @@ def handle_command(ext_uid: str, text: str) -> str:
                     u["current_chat_id"] = cid;
                     _save_store(store)
                     if (txt.strip() or imgs):
-                        owui_completed_save(
-                            token, cid, user_mid, assistant_mid_seed or None, user_content, txt, imgs,
+                        owui_completed_save(token, cid, user_mid, assistant_mid_seed or None, user_content, ("" if _is_placeholder_text(txt) or not txt else txt), imgs,
                             model=mdl, session_id=session_id
                         )
                 if not txt.strip() and imgs:
@@ -2129,7 +2254,9 @@ async def kf_incoming(request: Request, msg_signature: str, timestamp: str, nonc
                 _seen_add(txt_mid)  # ✅ 文字也持久去重
                 if reply.strip() in ("✅ 已生成图片（见上图）", "（模型生成中或无输出）", "") or _is_placeholder_text(reply):
                     continue
-                send_kf_text(ext_uid, reply)
+                (
+                None if _is_placeholder_text(reply) else send_kf_text(ext_uid, reply)
+            ) if not _is_placeholder_text(reply) else True
         except Exception:
             log.exception("kf worker error")
     threading.Thread(target=_worker, daemon=True).start()
@@ -2149,7 +2276,7 @@ def debug_ping_openwebui(ext_uid: Optional[str] = None, token: Optional[str] = N
         if not token and ext_uid:
             store = _load_store()
             u = store.get(ext_uid) or {}
-            token = u.get("token")
+            user_token= u.get("token")
         if not token:
             return {"ok": False, "error": "no token provided"}
         ms = owui_models(token)
@@ -2169,3 +2296,260 @@ def healthz():
     return {"ok": True}
 # —— 启动 outbox worker
 _outbox_start_once()
+
+
+def owui_overwrite_assistant_message(user_token: str, chat_id: str, assistant_id: str,
+                                     text: str, images: list[str], model: str,
+                                     parent_id: str | None = None, session_id: str = "") -> None:
+    # Fetch chat
+    js = owui_fetch_chat(user_token, chat_id)
+    chat = (js.get("chat") or js or {})
+    messages = list(chat.get("messages") or [])
+    history = chat.get("history") or {"current_id": None, "messages": {}}
+    hist_msgs = dict(history.get("messages") or {})
+    final_parts = _mk_content_parts(text, images)
+    found = False
+    for it in messages:
+        if isinstance(it, dict) and str(it.get("id")) == str(assistant_id) and it.get("role") == "assistant":
+            it["content"] = final_parts
+            if parent_id:
+                it["parentId"] = parent_id
+            it["modelName"] = model
+            found = True
+            break
+    if assistant_id in hist_msgs and isinstance(hist_msgs[assistant_id], dict):
+        hist_msgs[assistant_id]["content"] = final_parts
+        if parent_id:
+            hist_msgs[assistant_id]["parentId"] = parent_id
+        hist_msgs[assistant_id]["modelName"] = model
+        found = True
+    if not found:
+        new_assistant = {"id": assistant_id, "role":"assistant", "content": final_parts,
+                         "parentId": parent_id, "modelName": model, "modelIdx": 0, "timestamp": int(time.time()*1000)}
+        messages.append(new_assistant)
+        hist_msgs[assistant_id] = new_assistant
+    history["current_id"] = assistant_id
+    payload = {"chat": {"id": chat_id, "messages": messages, "history": {"current_id": assistant_id, "messages": hist_msgs}}}
+    r = _owui_req("POST", f"/api/v1/chats/{chat_id}", user_token, headers={"Content-Type":"application/json"}, json=payload)
+    if not r.ok:
+        raise _improve_http_error(r, "覆盖助手成品失败(/api/v1/chats/{id})")
+    # Completed close
+    try:
+        comp_body = {"chat_id": chat_id, "id": assistant_id, "session_id": session_id, "model": model}
+        r2 = _owui_req("POST", "/api/chat/completed", user_token, headers={"Content-Type":"application/json"}, json=comp_body)
+        if r2.ok:
+            log.info("OWUI POST /api/chat/completed -> %s (%s)", r2.status_code, r2.reason)
+        else:
+            log.warning("chat/completed non-200: %s %s", r2.status_code, r2.reason)
+    except Exception as e:
+        log.warning("chat/completed failed: %s", e)
+
+
+
+
+def _poll_until_final(user_token: str, chat_id: str, assistant_id: str, timeout_sec: float = 30.0, interval_sec: float = 0.6) -> tuple[str, list[str]]:
+    import time as _t
+    t0 = _t.time()
+    last_txt = ""
+    imgs: list[str] = []
+    while _t.time() - t0 <= timeout_sec:
+        r = _owui_req("GET", f"/api/v1/chats/{chat_id}?refresh=1", user_token)
+        if not r.ok:
+            _t.sleep(interval_sec); 
+            continue
+        js = r.json() if 'application/json' in (r.headers.get('Content-Type') or '') else {}
+        chat = js.get("chat") or js or {}
+        msgs = list(chat.get("messages") or [])
+        for m in msgs[::-1]:
+            if isinstance(m, dict) and str(m.get("id")) == str(assistant_id) and m.get("role") == "assistant":
+                txt = ""
+                c = m.get("content")
+                if isinstance(c, list):
+                    for p in c:
+                        if isinstance(p, dict) and p.get("type") == "text" and p.get("text"):
+                            txt += str(p["text"])
+                elif isinstance(c, str):
+                    txt = c
+                imgs = _extract_all_images_from_msg(m, txt)
+                if txt.strip() and not _is_placeholder_text(txt):
+                    log.info("complete(polled): text_len=%s preview=%r imgs=%s", len(txt), txt[:60], len(imgs))
+                    return txt, imgs
+                last_txt = txt or last_txt
+                break
+        _t.sleep(interval_sec)
+    return last_txt.strip(), imgs
+
+
+
+# ====== APPENDED PATCH: CI block for OWUI /tasks endpoints ======
+try:
+    _ORIG__OWUI_REQ = _owui_req  # keep original
+except NameError:
+    _ORIG__OWUI_REQ = None
+
+def _owui_req(method: str, path: str, token: str, **kwargs):
+    """
+    Patched OWUI request helper:
+    - force JSON Accept header
+    - HARD BLOCK any legacy /tasks endpoints (case-insensitive)
+    """
+    _p = str(path)
+    _pl = _p.lower()
+    if ("tasks" in _pl) or ("disabled-tasks" in _pl) or ("tasks_disabled" in _pl):
+        try:
+            log.error("HARD BLOCK: attempted to call %s", _p)
+        except Exception:
+            pass
+        raise RuntimeError(f"OWUI /tasks endpoints are disabled: {path}")
+
+    headers = kwargs.pop("headers", {}) or {}
+    headers.setdefault("Accept", "application/json")
+    kwargs["headers"] = headers
+
+    if _ORIG__OWUI_REQ is not None:
+        return _ORIG__OWUI_REQ(method, path, token, **kwargs)
+
+    # Fallback if original is not available:
+    import requests
+    base = OWUI_BASE.rstrip("/")
+    url = f"{base}{path}"
+    return requests.request(method.upper(), url, **kwargs)
+
+# Disable any task-based pollers if defined earlier:
+def _poll_task_result(*args, **kwargs):
+    raise RuntimeError("poll_task_result disabled; use chat polling via /api/v1/chats/{chat_id} only")
+# ====== END PATCH ======
+# >>> _PLACEHOLDER_GUARD >>>
+
+PLACEHOLDER_TEXTS = {
+    "（后台生成中…）",
+    "（处理中，请稍候…）",
+    "（模型生成中或无输出）",
+    "（模型生成完成，但无文本输出）",
+    "⌛ 已收到，正在生成…",
+    "",
+}
+def _is_placeholder_text(s: str) -> bool:
+    try:
+        t = (s or "").strip()
+    except Exception:
+        return True
+    if t in PLACEHOLDER_TEXTS:
+        return True
+    t_norm = t.replace("(", "（").replace(")", "）").replace("...", "…")
+    if "后台生成中" in t_norm or "处理中" in t_norm:
+        return True
+    return False
+
+# <<< _PLACEHOLDER_GUARD <<<
+
+# >>> _POLL_OVERRIDE >>>
+
+from typing import Optional, Tuple, List, Dict, Any
+def _poll_assistant_content(
+    user_token: str,
+    chat_id: str,
+    assistant_mid: Optional[str] = None,
+    timeout_sec: float = 20.0,
+    interval_sec: float = 0.7,
+    **kwargs  # swallow unknown kw like user_mid
+) -> Tuple[str, List[str]]:
+    """
+    Poll only /api/v1/chats/{chat_id}; if assistant_mid is None, target the latest assistant.
+    Treat placeholder/empty text without images as "not ready"; continue polling.
+    """
+    def _latest_assistant_id(js: Dict[str, Any]) -> Optional[str]:
+        msgs = []
+        if isinstance(js, dict):
+            if isinstance(js.get("messages"), list):
+                msgs = js["messages"]
+            else:
+                hist = ((js.get("chat") or {}).get("history") or {}).get("messages") or {}
+                if isinstance(hist, dict):
+                    msgs = list(hist.values())
+        msgs = [m for m in msgs if isinstance(m, dict) and m.get("role") == "assistant" and m.get("id")]
+        msgs.sort(key=lambda m: float(m.get("timestamp") or 0), reverse=True)
+        return str(msgs[0]["id"]) if msgs else None
+
+    import time
+    t0 = time.time()
+    last_err = None
+    while (time.time() - t0) < float(timeout_sec):
+        try:
+            js = owui_fetch_chat(user_token, chat_id)
+            target_id = assistant_mid or _latest_assistant_id(js)
+            if not target_id:
+                time.sleep(float(interval_sec)); continue
+            # gather messages
+            msgs = []
+            if isinstance(js, dict) and isinstance(js.get("messages"), list):
+                msgs = js["messages"]
+            if not msgs and isinstance(js, dict):
+                hist = ((js.get("chat") or {}).get("history") or {}).get("messages") or {}
+                if isinstance(hist, dict):
+                    msgs = list(hist.values())
+            for m in msgs:
+                if (m.get("role") == "assistant") and (str(m.get("id")) == str(target_id)):
+                    txt = _ensure_str_content(m).strip()
+                    imgs = _extract_images_from_msgobj(m, txt)
+                    if (not imgs) and _is_placeholder_text(txt):
+                        break
+                    if txt or imgs:
+                        return txt, imgs
+        except Exception as e:
+            last_err = e
+            try:
+                log.debug("poll chat error: %s", e)
+            except Exception:
+                pass
+        time.sleep(float(interval_sec))
+
+    if last_err:
+        try: log.debug("poll timeout last_err=%s", last_err)
+        except Exception: pass
+
+    # one last attempt
+    try:
+        js = owui_fetch_chat(user_token, chat_id)
+        target_id = assistant_mid or _latest_assistant_id(js)
+        if target_id:
+            msgs = []
+            if isinstance(js, dict) and isinstance(js.get("messages"), list):
+                msgs = js["messages"]
+            else:
+                hist = ((js.get("chat") or {}).get("history") or {}).get("messages") or {}
+                if isinstance(hist, dict):
+                    msgs = list(hist.values())
+            for m in msgs:
+                if (m.get("role") == "assistant") and (str(m.get("id")) == str(target_id)):
+                    txt = _ensure_str_content(m).strip()
+                    imgs = _extract_images_from_msgobj(m, txt)
+                    return txt, imgs
+    except Exception as e:
+        try: log.debug("final poll read error: %s", e)
+        except Exception: pass
+    return "", []
+
+# <<< _POLL_OVERRIDE <<<
+
+
+def _ensure_wechat_compatible_image(data: bytes, filename: str) -> tuple[bytes, str]:
+    # Ensure the image is compatible with WeCom: convert WEBP -> JPEG and respect size limit.
+    try:
+        ext = (os.path.splitext(filename)[-1] or "").lower()
+    except Exception:
+        ext = ".jpg"
+    # Convert WEBP to JPG (WeCom may reject WEBP)
+    if ext in (".webp",):
+        try:
+            if _PIL_OK:
+                im = Image.open(io.BytesIO(data)).convert("RGB")
+                buf = io.BytesIO()
+                im.save(buf, format="JPEG", quality=88, optimize=True)
+                data = buf.getvalue()
+                filename = (os.path.splitext(filename)[0] or "image") + ".jpg"
+        except Exception as e:
+            log.warning("webp->jpg convert failed: %s", e)
+    # Finally enforce size limit
+    data = _maybe_downscale_to_limit(data, filename)
+    return data, filename
