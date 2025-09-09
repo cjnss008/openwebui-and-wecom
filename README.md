@@ -36,3 +36,9 @@ docker compose up -d
 - GET /debug/ping-openwebui
 - GET /debug/state?ext_uid=OPENID
 - GET /debug/ratelimit
+
+## 效果
+<img width="1134" height="844" alt="image" src="https://github.com/user-attachments/assets/2cb4147e-fb13-4dc0-8a7d-7c93a905d746" />
+<img width="1798" height="1244" alt="image" src="https://github.com/user-attachments/assets/2a92129f-7906-488e-9bee-208e44cf0fab" />
+
+
