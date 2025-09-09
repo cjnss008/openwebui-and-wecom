@@ -13,6 +13,13 @@ try:
 except Exception:
     _PIL_OK = False
 
+
+def _build_fixed_room_title(seed_text: str) -> str:
+    import re as _re, time as _time
+    base = _strip_md_for_wechat(seed_text or "").strip()
+    base = _re.sub(r'\s+', ' ', base)[:16] or "会话"
+    ts = _time.strftime("%Y%m%d-%H%M", _time.localtime())
+    return f"{base} · {ts}"
 def _pick_chat_id(user_token: str, fallback_chat_id: str):
     """
     兼容旧调用：尝试回读 chat，返回 (chat_id, chat_json)。失败则返回 fallback。
@@ -68,7 +75,7 @@ LAST_IMAGE_TTL = int(_env("WECOM_LAST_IMAGE_TTL") or "900")  # 最近图片有�
 DEBUG_HTTP = int(_env("DEBUG_HTTP") or "0")  # 1 打印请求/响应摘要
 RATE_LIMIT_COOLDOWN_SEC = int(_env("WECOM_KF_RL_COOLDOWN_SEC") or "60")
 MAX_CONTEXT_MSGS = int(_env("OWUI_MAX_CONTEXT_MSGS") or "30")
-POLL_TIMEOUT_SEC = float(_env("WECOM_POLL_TIMEOUT_SEC") or "30")
+POLL_TIMEOUT_SEC = float(_env("WECOM_POLL_TIMEOUT_SEC") or "300")
 POLL_INTERVAL_SEC = float(_env("WECOM_POLL_INTERVAL_SEC") or "0.6")
 OWUI_FORCE_ASSISTANT_PLACEHOLDER_WHEN_EMPTY = int(_env("OWUI_FORCE_ASSISTANT_PLACEHOLDER_WHEN_EMPTY") or "0")
 # —— 关键修复：启动期丢弃旧消息 + 持久去重配置 ——
@@ -350,30 +357,6 @@ def _extract_images_from_msgobj(msg_obj: Dict[str, Any], text: str) -> List[str]
                 iu = p.get("image_url")
                 if isinstance(iu, dict) and iu.get("url"):
                     images.append(iu["url"])
-    # Also look into common attachment-like containers
-    for k in ("attachments", "files", "artifacts", "image_urls"):
-        v = msg_obj.get(k)
-        if isinstance(v, list):
-            for it in v:
-                if isinstance(it, str):
-                    images.append(it)
-                elif isinstance(it, dict):
-                    u = it.get("url") or it.get("src") or it.get("image_url") or ((it.get("image_url") or {}).get("url"))
-                    if isinstance(u, dict):
-                        u = u.get("url")
-                    if isinstance(u, str) and u:
-                        images.append(u)
-    # Handle OpenAI-like image data (data[].b64_json) possibly with mime_type
-    try:
-        data_list = msg_obj.get("data")
-        if isinstance(data_list, list):
-            for it in data_list:
-                b64 = (it or {}).get("b64_json")
-                if b64:
-                    mime = (it or {}).get("mime_type") or "image/png"
-                    images.append(f"data:{mime};base64,{b64}")
-    except Exception:
-        pass
     images += _extract_images_from_text(text)
     seen = set();
     im_out = []
@@ -762,7 +745,7 @@ def owui_chat_complete(
         assistant_id=assistant_id,
         session_id=session_id,
         # keep title generation enabled so OWUI auto-titles as before
-        background_tasks={"title_generation": True},
+        background_tasks={"title_generation": False},
     )
 
     # 2) short-circuit if direct content is returned immediately
@@ -798,7 +781,7 @@ def owui_chat_complete(
                 timeout_sec=max(0.3, SHORT),
                 interval_sec=INTERVAL,
             )
-            if (c_text and c_text.strip()) or c_imgs:
+            if (c_imgs) or (c_text and c_text.strip() and c_text.strip() != "…"):
                 got_text, got_imgs = c_text or "", c_imgs or []
         except Exception as e:
             log.warning("short poll failed: %s", e)
@@ -813,7 +796,7 @@ def owui_chat_complete(
                     timeout_sec=left,
                     interval_sec=max(0.3, globals().get("POLL_INTERVAL_SEC", 0.7)),
                 )
-                if (c_text and c_text.strip()) or c_imgs:
+                if (c_imgs) or (c_text and c_text.strip() and c_text.strip() != "…"):
                     got_text, got_imgs = c_text or "", c_imgs or []
             except Exception as e:
                 log.warning("long poll failed: %s", e)
@@ -1369,6 +1352,7 @@ def __send_kf_image_bytes_raw(external_userid: str, data: bytes, filename: str =
         if js.get("errcode") != 0:
             code = int(js.get("errcode") or 0)
             return False, code
+        log.info("kf/send_msg image ok")
         return True, None
     except Exception:
         log.exception("kf/send_msg image http error: %s", getattr(r, "text", "")[:300])
@@ -1431,7 +1415,7 @@ def _maybe_downscale_to_limit(data: bytes, filename: str) -> bytes:
         log.warning("downscale failed: %s", e)
     return data
 def _kf_upload_image_bytes(data: bytes, filename: str = "image.png") -> Optional[str]:
-    data, filename = _ensure_wechat_compatible_image(data, filename)
+    data = _maybe_downscale_to_limit(data, filename)
     mime = mimetypes.guess_type(filename)[0] or "application/octet-stream"
     files = {"media": (filename, data, mime)}
     access = get_kf_access_token()
@@ -1461,7 +1445,7 @@ def _kf_upload_image_bytes(data: bytes, filename: str = "image.png") -> Optional
         log.warning("media/upload fallback failed: %s", e)
     return None
 def send_kf_image_by_bytes(external_userid: str, data: bytes, filename: str = "image.jpg") -> bool:
-    data, filename = _ensure_wechat_compatible_image(data, filename)
+    data = _maybe_downscale_to_limit(data, filename)
     if _under_rl(external_userid):
         item = {
             "id": f"i_{uuid.uuid4().hex}",
@@ -1507,8 +1491,17 @@ def send_kf_image_by_url(external_userid: str, url: str, user_token: Optional[st
         p = urlparse(abs_url)
         if (p.scheme, p.netloc) == (o.scheme, o.netloc) and (user_token or ""):
             headers["Authorization"] = f"Bearer {user_token}"
-        r = requests.get(abs_url, headers=headers, timeout=25)
-        if not r.ok or not r.content:
+        # 有些 /api/v1/files 存在短暂生成延迟，做 3 次重试
+        _last = None
+        for _try in range(3):
+            r = requests.get(abs_url, headers=headers, timeout=25)
+            if r.ok and r.content:
+                break
+            _last = r
+            time.sleep(0.8)
+        r = r if (r.ok and r.content) else _last
+        if (not r) or (not r.ok) or (not r.content):
+            raise RuntimeError(f"download failed status={getattr(r,'status_code',-1)} size={len(getattr(r,'content',b''))}")
             raise RuntimeError(f"download failed status={r.status_code} size={len(r.content)}")
         ctype = (r.headers.get("content-type") or "").lower()
         ext = (os.path.splitext(p.path or "")[-1] or "").lower()
@@ -1829,7 +1822,7 @@ def handle_command(ext_uid: str, text: str) -> str:
             if not mdl:
                 return "未设置默认模型。请先发 3 选择模型。"
             try:
-                new_cid, _, _ = owui_create_new_chat_form(token, title=None, models=[mdl])
+                new_cid, _, _ = owui_create_new_chat_form(token, title=_build_fixed_room_title(text), models=[mdl])
                 # ✅ 立刻写入当前会话，避免后续消息又新建房间
                 u["current_chat_id"] = new_cid or ""
                 _save_store(store)
@@ -1837,7 +1830,7 @@ def handle_command(ext_uid: str, text: str) -> str:
                 user_mid = owui_append_user_message(token, new_cid, mdl, user_content)
                 # 先给微信一个“已收到，正在生成”的立即反馈
                 try:
-                    send_kf_text(ext_uid, "⌛ 已收到，正在生成…")
+                    send_kf_text(ext_uid, "⌛ 已收到请求，正在生成解答…")
                 except Exception:
                     pass
                 messages_for_llm = _build_messages_for_completion(token, new_cid)
@@ -2022,7 +2015,7 @@ def handle_command(ext_uid: str, text: str) -> str:
                 except Exception as e:
                     if _is_http_status(e, 401) or _is_http_status(e, 404):
                         log.warning("append to chat(%s) unauthorized/not found, creating new chat...", chat_id)
-                        new_cid, _, _ = owui_create_new_chat_form(token, title=None, models=[mdl] if mdl else None)
+                        new_cid, _, _ = owui_create_new_chat_form(token, title=_build_fixed_room_title(text), models=[mdl] if mdl else None)
                         if not new_cid:
                             raise
                         user_mid = owui_append_user_message(token, new_cid, mdl, user_content)
@@ -2033,7 +2026,7 @@ def handle_command(ext_uid: str, text: str) -> str:
                         raise
                 # 立即回执
                 try:
-                    send_kf_text(ext_uid, "⌛ 已收到，正在生成…")
+                    send_kf_text(ext_uid, "⌛ 已收到请求，正在生成解答…")
                 except Exception:
                     pass
                 messages_for_llm = _build_messages_for_completion(token, chat_id)
@@ -2087,9 +2080,7 @@ def handle_command(ext_uid: str, text: str) -> str:
                 mdl = (u.get("model") or DEFAULT_MODEL or "").strip()
                 if not mdl:
                     return "未设置默认模型。请先发 3 选择模型。"
-                new_cid, _, _ = owui_create_new_chat_form(
-                    token, title=None, models=[mdl]
-                )
+                new_cid, _, _ = owui_create_new_chat_form(token, title=_build_fixed_room_title(text), models=[mdl])
                 # ✅ 一创建就保存为当前会话
                 u["current_chat_id"] = new_cid or ""
                 _save_store(store)
@@ -2097,10 +2088,11 @@ def handle_command(ext_uid: str, text: str) -> str:
                 user_mid = owui_append_user_message(token, new_cid, mdl, user_content)
                 # 回执
                 try:
-                    send_kf_text(ext_uid, "⌛ 已收到，正在生成…")
+                    send_kf_text(ext_uid, "⌛ 已收到请求，正在生成解答…")
                 except Exception:
                     pass
                 messages_for_llm = _build_messages_for_completion(token, new_cid)
+                assistant_mid_seed = None
                 try:
                     txt, imgs, created, _ = owui_chat_complete(
                         user_token=token, messages=messages_for_llm, model=mdl,
@@ -2281,7 +2273,7 @@ def debug_ping_openwebui(ext_uid: Optional[str] = None, token: Optional[str] = N
             return {"ok": False, "error": "no token provided"}
         ms = owui_models(token)
         first = ms[0] if ms else None
-        cid, u_mid, a_mid = owui_create_new_chat_form(token, title=None, models=[first["id"]] if first else [])
+        cid, u_mid, a_mid = owui_create_new_chat_form(token, title=_build_fixed_room_title("API创建"), models=[first["id"]] if first else [])
         return {"ok": True, "models_count": len(ms), "first_model": first, "new_chat_id": cid, "user_mid": u_mid,
                 "assistant_mid": a_mid}
     except Exception as e:
@@ -2426,7 +2418,7 @@ PLACEHOLDER_TEXTS = {
     "（处理中，请稍候…）",
     "（模型生成中或无输出）",
     "（模型生成完成，但无文本输出）",
-    "⌛ 已收到，正在生成…",
+    "⌛ 已收到请求，正在生成解答…",
     "",
 }
 def _is_placeholder_text(s: str) -> bool:
@@ -2532,24 +2524,50 @@ def _poll_assistant_content(
 
 # <<< _POLL_OVERRIDE <<<
 
+# --- begin: non-intrusive fragment wrapper for send_kf_text ---
+try:
+    _send_kf_text_callthrough  # type: ignore[name-defined]
+except NameError:
+    _send_kf_text_callthrough = send_kf_text  # keep original callable
 
-def _ensure_wechat_compatible_image(data: bytes, filename: str) -> tuple[bytes, str]:
-    # Ensure the image is compatible with WeCom: convert WEBP -> JPEG and respect size limit.
-    try:
-        ext = (os.path.splitext(filename)[-1] or "").lower()
-    except Exception:
-        ext = ".jpg"
-    # Convert WEBP to JPG (WeCom may reject WEBP)
-    if ext in (".webp",):
-        try:
-            if _PIL_OK:
-                im = Image.open(io.BytesIO(data)).convert("RGB")
-                buf = io.BytesIO()
-                im.save(buf, format="JPEG", quality=88, optimize=True)
-                data = buf.getvalue()
-                filename = (os.path.splitext(filename)[0] or "image") + ".jpg"
-        except Exception as e:
-            log.warning("webp->jpg convert failed: %s", e)
-    # Finally enforce size limit
-    data = _maybe_downscale_to_limit(data, filename)
-    return data, filename
+def send_kf_text(external_userid: str, content: str) -> bool:
+    """
+    Fragment wrapper (minimal and non-intrusive):
+    - Split every 600 chars, up to 5 parts; overflow is dropped.
+    - Add numbering "（i/n）- " only when n > 1 (1/1 not shown).
+    - Sleep a short interval between parts to align with 91005 frequency.
+    - Delegate each part to the original send_kf_text via _send_kf_text_callthrough.
+    """
+    import os
+    import time
+
+    s = content or ""
+    # Preserve original behavior for placeholders / empty
+    if not s:
+        return _send_kf_text_callthrough(external_userid, s)
+
+    # Fast path: <=600 -> call through without numbering to avoid noise
+    if len(s) <= 600:
+        return _send_kf_text_callthrough(external_userid, s)
+
+    # Build up to 5 fragments, 600 chars each
+    parts = []
+    i, n = 0, len(s)
+    while i < n and len(parts) < 5:
+        j = min(n, i + 600)
+        parts.append(s[i:j])
+        i = j
+
+    total = len(parts)
+    delay = float(os.getenv("WECOM_FRAGMENT_DELAY_SEC", "0.9"))
+
+    all_ok = True
+    for idx, p in enumerate(parts, 1):
+        msg = (f"（{idx}/{total}）- {p}" if total > 1 else p)
+        ok = _send_kf_text_callthrough(external_userid, msg)
+        all_ok = all_ok and ok
+        # small pause between parts to avoid 91005 rate limit
+        if idx < total:
+            time.sleep(delay)
+    return all_ok
+# --- end: non-intrusive fragment wrapper for send_kf_text ---
